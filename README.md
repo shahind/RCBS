@@ -4,7 +4,12 @@ This MATLAB library enables RC development of multi zone buildings.
 ![RC Building Simulation Visualization](visualization.jpg) 
 
 ## Installation
-Just add the main folder to the MATLAB directory or add the directory of the library to your MATLAB path.
+Download the latest version from [relases section](https://github.com/shahind/RCBS/releases) and extract the files. Just copy the main folder to your MATLAB project directory or add the directory of the library to your MATLAB paths:
+
+```matlab
+addpath Path_To_RCBS_Folder
+savepath
+```
 
 ## Usage
 ### 1. Start with creating a new building:
