@@ -31,6 +31,50 @@ classdef Zone < handle
             obj.nodes(1).isMain = true;
         end
         
+        function set.C_main(obj, val)
+            % SET.C_MAIN  Keep the main (air) node capacitance in sync with C_main.
+            %   Fixes the long-standing bug where addZone(name,'C_main',val) or a
+            %   later  z.C_main = val  assignment did NOT update nodes(1).C, so
+            %   every zone silently kept the 1e5 J/K default.
+            %   Units: val in J/K.
+            obj.C_main = val;
+            if ~isempty(obj.nodes)
+                obj.nodes(1).C = val;
+            end
+        end
+
+        function setAir(obj, C_air, T0)
+            % SETAIR  Set the main (indoor-air) node capacitance and initial temp.
+            %   setAir(C_air)         C_air [J/K]
+            %   setAir(C_air, T0)     T0    [degC] initial air temperature
+            obj.nodes(1).C = C_air;
+            obj.C_main     = C_air;
+            if nargin > 2 && ~isempty(T0)
+                obj.nodes(1).T = T0;
+            end
+        end
+
+        function T = getNodeTemp(obj, nodeName)
+            % GETNODETEMP  Current temperature [degC] of a named node in this zone.
+            %   During a run this reflects the LIVE state (Simulation writes it back
+            %   every step); outside a run it is the last stored / initial value.
+            k = find(strcmp({obj.nodes.name}, nodeName), 1);
+            if isempty(k)
+                error('Zone:getNodeTemp:noNode', 'Node "%s" not in zone "%s".', nodeName, obj.name);
+            end
+            T = obj.nodes(k).T;
+        end
+
+        function setNodeTemp(obj, nodeName, T)
+            % SETNODETEMP  Write a node temperature [degC]. Used by Simulation to
+            %   push live state so heat-source closures / controllers can read it.
+            k = find(strcmp({obj.nodes.name}, nodeName), 1);
+            if isempty(k)
+                error('Zone:setNodeTemp:noNode', 'Node "%s" not in zone "%s".', nodeName, obj.name);
+            end
+            obj.nodes(k).T = T;
+        end
+
         function idx = addNode(obj, nodename, C, T0)
             if nargin<4, T0 = obj.nodes(1).T; end
             nd.name = nodename;
@@ -72,13 +116,52 @@ classdef Zone < handle
             obj.resistors(end+1) = struct('n1', 1, 'n2', idx, 'R', R_int, 'name', [name '_m']);
         end
         
-        function connectToZone(obj, otherZone, R_between, name)
-            if nargin<4, name = sprintf('%s_to_%s', obj.name, otherZone.name); end
-            
-            % Define the resistor struct
-            r = struct('n1', struct('zone', obj, 'idx', 1), 'n2', struct('zone', otherZone, 'idx', 1), 'R', R_between, 'name', name);
-            
-            % Append the connection to both zones.
+        function connectToZone(obj, otherZone, R_between, name, C_mid, T0, kind)
+            % CONNECTTOZONE  Couple this zone's air node to another zone's air node.
+            %
+            %   connectToZone(other, R, name)
+            %       a plain conductance G = 1/R between the two zone air nodes
+            %       (a lightweight air path / open doorway).
+            %
+            %   connectToZone(other, R_total, name, C_mid, T0)
+            %       a capacitive T-network  R_total/2 - C_mid - R_total/2  between
+            %       the two zone air nodes: an interior PARTITION WALL (same
+            %       storey) or a FLOOR/CEILING SLAB (this zone's ceiling = the
+            %       other zone's floor). The mid node (thermal mass of the
+            %       partition / deck) is created inside THIS zone; T0 is its
+            %       initial temperature (default = this zone's air temperature).
+            %
+            %   connectToZone(other, R_total, name, C_mid, T0, kind)
+            %       KIND is a drawing hint only ('wall' | 'slab' | 'air'); it does
+            %       not change the physics.  It tells RCBS.Building.visualize how
+            %       to route the coupling: 'wall' - between the facing side edges,
+            %       'slab' - between the lower ceiling and the upper floor edges,
+            %       'air' - straight between the air nodes.  Default: 'wall' for a
+            %       capacitive coupling, 'air' for a plain one.
+            %
+            %   R_total [K/W], C_mid [J/K]. The connection is registered on both
+            %   zones; RCBS.Simulation resolves it once.
+            if nargin < 4 || isempty(name), name = sprintf('%s_to_%s', obj.name, otherZone.name); end
+            isCap = nargin >= 5 && ~isempty(C_mid) && C_mid > 0;
+            if nargin < 7 || isempty(kind)
+                if isCap, kind = 'wall'; else, kind = 'air'; end
+            end
+
+            if isCap
+                if nargin < 6 || isempty(T0), T0 = obj.nodes(1).T; end
+                idxMid = obj.addNode([name '_c'], C_mid, T0);
+                % this-zone air  <->  mid node   (R/2, a normal in-zone resistor)
+                obj.resistors(end+1) = struct('n1', 1, 'n2', idxMid, 'R', R_between/2, 'name', [name '_a']);
+                % mid node  <->  other-zone air  (R/2, a cross-zone resistor)
+                r = struct('n1', struct('zone', obj,       'idx', idxMid), ...
+                           'n2', struct('zone', otherZone, 'idx', 1), ...
+                           'R', R_between/2, 'name', [name '_b'], 'kind', kind);
+            else
+                r = struct('n1', struct('zone', obj,       'idx', 1), ...
+                           'n2', struct('zone', otherZone, 'idx', 1), ...
+                           'R', R_between, 'name', name, 'kind', kind);
+            end
+
             obj.crossRes{end+1} = r;
             otherZone.crossRes{end+1} = r;
         end
@@ -105,27 +188,6 @@ classdef Zone < handle
         
         function nodeCount = getNodeCount(obj)
             nodeCount = numel(obj.nodes);
-        end
-        
-        function [A_local, b_local, nodeIndexMap] = assembleLocalLinear(obj, globalIndexBase, nodeGlobalMap)
-            % Assemble local contributions for nodes internal to this zone.
-            % Returns A_local (n x n diagonal capacities), b_local initial (n x1),
-            % nodeIndexMap mapping local idx->global idx
-            n = numel(obj.nodes);
-            nodeIndexMap = zeros(n,1);
-            for i=1:n
-                % global index: either provided map or base+local
-                if nargin>=3 && ~isempty(nodeGlobalMap)
-                    key = sprintf('%s.%s', obj.storey.name, obj.name);
-                    % nodeGlobalMap is built in Simulation; here assume nodes are already mapped
-                    nodeIndexMap(i) = nodeGlobalMap(sprintf('%s.%s.%s', obj.storey.name, obj.name, obj.nodes(i).name));
-                else
-                    nodeIndexMap(i) = globalIndexBase + i - 1;
-                end
-            end
-            % A_local will be processed by Simulation directly; this function is a helper stub
-            A_local = [];
-            b_local = [];
         end
     end
 end
